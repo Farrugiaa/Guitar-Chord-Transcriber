@@ -1,0 +1,43 @@
+audio:
+  sample_rate: 44100
+  mono: true
+  duration: 30.0  # seconds per training segment
+
+features:
+  n_fft: 4096
+  hop_length: 512
+  n_mels: 128
+  n_cqt_bins: 84  # 7 octaves * 12 bins
+  bins_per_octave: 12
+  fmin: 32.7  # C1
+
+separator:
+  model: "unet"
+  n_fft: 4096
+  hop_length: 1024
+  channels: [16, 32, 64, 128, 256, 512]
+  dropout: 0.1
+
+chord_recogniser:
+  model: "crnn"
+  input_features: "cqt"
+  n_cqt_bins: 84
+  conv_channels: [32, 64, 128]
+  rnn_hidden: 256
+  rnn_layers: 2
+  dropout: 0.3
+  context_frames: 21  # ~0.25s context at default hop
+
+training:
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 100
+  patience: 15
+  scheduler: "cosine"
+
+chord_vocabulary: "extended"  # "basic", "sevenths", "extended"
+
+output:
+  format: "text"  # "text", "musicxml", "midi"
+  beats_per_bar: 4

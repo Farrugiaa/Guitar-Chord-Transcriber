@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data and models (too large for git)
+data/raw/
+data/maestro/
+data/maps/
+data/dadagp/
+checkpoints/*.pt
+outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tensorboard
+runs/
+
+# Generated evaluation artefacts
+evaluation/*.csv
