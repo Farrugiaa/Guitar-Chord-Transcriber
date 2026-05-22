@@ -37,17 +37,7 @@ def _is_minor_maj7(label: str) -> bool:
 
 
 class GuitarChordPipeline:
-    """
-    End-to-end pipeline for extracting guitar chords from audio.
-
-    Usage:
-        pipeline = GuitarChordPipeline.from_checkpoints(
-            separator_path="checkpoints/separator.pt",
-            recogniser_path="checkpoints/chord_recogniser.pt",
-        )
-        result = pipeline.process("song.wav")
-        print(result.formatted_output)
-    """
+    """End-to-end pipeline: audio file → chord progression."""
 
     def __init__(
         self,
@@ -130,17 +120,7 @@ class GuitarChordPipeline:
         )
 
     def process(self, audio_path: str, pre_separated: bool = False) -> "PipelineResult":
-        """
-        Process an audio file through the full pipeline.
-
-        Args:
-            audio_path:     Path to the input audio file.
-            pre_separated:  If True the file is already a guitar-only stem —
-                            skip Demucs/U-Net and use the audio directly.
-
-        Returns:
-            PipelineResult with analysis, chords, and formatted output.
-        """
+        """Run the full pipeline on an audio file. pre_separated skips source separation."""
         # Keep stereo for loading — vocal removal uses both channels
         waveform, _ = self.feature_extractor.load_audio(audio_path, mono=False)
 
@@ -169,6 +149,11 @@ class GuitarChordPipeline:
             guitar_waveform = torch.from_numpy(guitar_np).unsqueeze(0)
             print("  [Guitar extraction] Done.")
 
+        # Polyphonic audio-to-MIDI via basic-pitch (ONNX backend, no TF needed)
+        print("  [Audio-to-MIDI] Running basic-pitch transcription...")
+        basic_pitch_midi = self._run_basic_pitch(guitar_waveform, self.sample_rate)
+        print("  [Audio-to-MIDI] Done." if basic_pitch_midi else "  [Audio-to-MIDI] Skipped.")
+
         # Tuning detection on guitar stem so pYIN doesn't pick up vocals or bass
         guitar_mono = guitar_waveform.squeeze().numpy()
         if self._forced_tuning is not None:
@@ -190,14 +175,14 @@ class GuitarChordPipeline:
             sample_rate=self.sample_rate,
             bpm=analysis.bpm,
             time_signature=analysis.time_signature,
+            beat_times=analysis.beat_times,
         )
         print(f"  [Strum] Done. Pattern: "
               f"{''.join(b.direction or '·' for b in strum_pattern.beats)}")
 
         cqt = self.feature_extractor.compute_cqt(guitar_waveform)
 
-        # Chroma is always computed — it feeds the UI confidence display and
-        # acts as a fallback when the CRNN confidence is below threshold.
+        # Chroma feeds confidence display and acts as fallback when CRNN is below threshold
         chroma_labels, window_confidence_data = self._chroma_chord_detection(
             guitar_waveform, key=analysis.key, scale_type=analysis.scale_type,
             tuning=tuning,
@@ -210,7 +195,7 @@ class GuitarChordPipeline:
                 self.vocabulary.decode(idx) for idx in chord_indices
             ]
             n = min(len(crnn_labels), len(chroma_labels), len(frame_confidences))
-            # 0.35: in-domain model hits 0.9+; wrong predictions on OOD audio sit below 0.3
+            # 0.35 threshold: in-domain hits 0.9+, out-of-domain wrong predictions sit below 0.3
             threshold = 0.35
             frame_labels = [
                 crnn_labels[i] if frame_confidences[i] >= threshold
@@ -220,9 +205,7 @@ class GuitarChordPipeline:
         else:
             frame_labels = chroma_labels
 
-        # Tab-derived chords: fret+tuning → exact pitch classes — more authoritative
-        # than spectral chroma. onset_root_pc intentionally skipped: when the CNN mutes
-        # the bass string the "lowest active" string gives the wrong root.
+        # Tab-derived chords: fret+tuning → exact pitch classes, more accurate than chroma
         try:
             from src.features.tab_exporter import PitchTabExporter as _PTE
             _ckpt = Path(__file__).parent.parent.parent / "guitar_only" / "checkpoints" / "tab_cnn_best.pt"
@@ -268,12 +251,24 @@ class GuitarChordPipeline:
         # Chord builder outputs all-sharps internally; convert to flats for flat keys
         frame_labels = self._respell_for_key(frame_labels, analysis.key)
 
+        # Final vocabulary filter: keep only major, minor, 7th, maj7, m7, power, sus
+        frame_labels = [self._simplify_chord(lbl) for lbl in frame_labels]
+
+        # MIDI override: replaces chroma labels where basic-pitch detected real chords
+        if basic_pitch_midi is not None:
+            frame_labels = self._apply_midi_chord_override(
+                frame_labels, basic_pitch_midi,
+                analysis.bpm, analysis.key, analysis.scale_type,
+                tuning=tuning,
+            )
+
         sections = self.structure_segmenter.segment(guitar_waveform)
 
         chord_events = self.formatter.frames_to_chord_events(
             frame_labels,
             hop_length=self.hop_length,
             sample_rate=self.sample_rate,
+            bpm=analysis.bpm,
         )
 
         if window_confidence_data:
@@ -307,6 +302,7 @@ class GuitarChordPipeline:
             tuning=tuning,
             tuning_confidence=tuning_confidence,
             strum_pattern=strum_pattern,
+            basic_pitch_midi=basic_pitch_midi,
         )
 
         from pathlib import Path as _Path
@@ -322,11 +318,7 @@ class GuitarChordPipeline:
     def _snap_chords_to_key(
         self, frame_labels: list[str], key: str, scale_type: str
     ) -> list[str]:
-        """
-        Post-process chord labels so that any chord whose root falls outside
-        the detected key is replaced by the nearest diatonic triad.
-        Chords whose root is already a scale note are kept unchanged.
-        """
+        """Snap non-diatonic roots to the nearest scale note. Keeps borrowed chords (bVII, bIII, bVI)."""
         scale_analyser = ScaleAnalyser()
         scale_pcs = set(scale_analyser.get_scale_pitch_classes(key, scale_type))
         diatonic = scale_analyser.get_diatonic_chords(key, scale_type, include_sevenths=False)
@@ -334,6 +326,12 @@ class GuitarChordPipeline:
             IntervalAnalyser.note_to_pitch_class(c["root"]): c["symbol"]
             for c in diatonic
         }
+
+        # roots from the parallel minor are valid borrowed chords — keep them
+        tonic_str = key.split()[0] if " " in key else key
+        tonic_pc = IntervalAnalyser.note_to_pitch_class(tonic_str)
+        _minor_intervals = (0, 2, 3, 5, 7, 8, 10)
+        parallel_minor_pcs = {(tonic_pc + i) % 12 for i in _minor_intervals}
 
         result: list[str] = []
         for label in frame_labels:
@@ -346,83 +344,80 @@ class GuitarChordPipeline:
                 continue
             root_pc = IntervalAnalyser.note_to_pitch_class(root_str)
             if root_pc in scale_pcs:
-                # Root is diatonic — keep it unless the quality is UNKNOWN ("?")
+                # Diatonic root — keep, but resolve unknown quality chords
                 if label.endswith("?"):
                     result.append(pc_to_diatonic.get(root_pc, label))
                 else:
                     result.append(label)
+            elif root_pc in parallel_minor_pcs:
+                result.append(label)
             else:
-                nearest_pc = min(
+                # genuinely non-diatonic — snap upward (CQT smear biases downward)
+                nearest_up = min(
                     scale_pcs,
-                    key=lambda pc: min(abs(pc - root_pc), 12 - abs(pc - root_pc)),
+                    key=lambda pc: (pc - root_pc) % 12,
                 )
-                result.append(pc_to_diatonic.get(nearest_pc, label))
+                result.append(pc_to_diatonic.get(nearest_up, label))
         return result
 
     @staticmethod
     def _simplify_chord(label: str) -> str:
-        """Reduce chord labels to root + basic triad quality (major/minor/dim/aug).
-
-        7th chords and all higher extensions are stripped back to the triad.
-        The chord builder over-detects 7ths when adjacent chord tones bleed
-        into a window; showing the simpler triad matches guitar chord-sheet
-        convention and avoids misleading the player.
-
-        Examples: Ebm7→Ebm, Bmaj7→B, Db7→Db, Gbsus4(13)→Gb, Ebm9→Ebm.
-        """
-        if not label or label == "N.C.":
+        """Reduce to: major, minor, 7, maj7, m7, power (5), sus2/sus4."""
+        if not label or label in ("N.C.", ""):
             return label
 
-        # Extract root (letter + optional accidental)
         i = 1
-        if i < len(label) and label[i] in '#b':
+        if i < len(label) and label[i] in "#b":
             i += 1
-        root = label[:i]
-        remainder = label[i:]
+        root   = label[:i]
+        suffix = label[i:]
 
-        # Quality pairs: (detected_prefix, simplified_output).
-        # Checked in priority order; 'm7' before 'm' prevents 'm' matching 'maj'.
-        # All 7th/extended variants collapse to their base triad quality.
-        QUALITY_PAIRS = [
-            ('m7',   'm'),    # Ebm7  → Ebm
-            ('maj7', ''),     # Bmaj7 → B
-            ('dim7', 'dim'),  # Bdim7 → Bdim
-            ('m',    'm'),
-            ('dim',  'dim'),
-            ('aug',  'aug'),
-            ('7',    ''),     # F7, Db7 → F, Db
-            ('',     ''),
-        ]
-        for q_key, q_out in QUALITY_PAIRS:
-            if not q_key:
-                return root + q_out
-            if remainder.startswith(q_key):
-                after = remainder[len(q_key):]
-                if (not after
-                        or after[0].isdigit()
-                        or after[0] in '(,/'
-                        or after.startswith(('add', 'sus', 'b', '#'))):
-                    return root + q_out
-        return root
+        # split slash chords, simplify root, reattach bass note
+        bass = ""
+        if "/" in suffix:
+            slash_idx = suffix.index("/")
+            bass   = suffix[slash_idx:]   # e.g. "/B"
+            suffix = suffix[:slash_idx]
+
+        if suffix == "5" or suffix.startswith("5("):
+            return root + "5" + bass
+
+        if "sus" in suffix:
+            return root + ("sus2" if "sus2" in suffix else "sus4") + bass
+
+        if suffix.startswith(("m7b5", "ø", "m7♭5")):
+            return root + "m7" + bass
+
+        if suffix.startswith("m7") or suffix.startswith("min7"):
+            return root + "m7" + bass
+
+        # 'maj' must come before 'm' check
+        if suffix.startswith("maj") or suffix.startswith("M7"):
+            if suffix.startswith(("maj7", "M7")):
+                return root + "maj7" + bass
+            if len(suffix) > 3 and suffix[3].isdigit():
+                return root + "maj7" + bass   # maj9/11/13 → maj7
+            return root + bass
+
+        if suffix.startswith("m") and len(suffix) > 1 and suffix[1].isdigit():
+            return root + "m7" + bass   # m9, m11, m13 → m7
+
+        if suffix.startswith(("m", "min", "dim")):
+            return root + "m" + bass
+
+        if suffix.startswith(("7", "9", "11", "13")):
+            return root + "7" + bass
+
+        if suffix.startswith("aug"):
+            return root + bass
+
+        return root + bass
 
     @staticmethod
     def _validate_chord_quality_with_key(
         frame_labels: list[str], key: str, scale_type: str
     ) -> list[str]:
-        """Replace complex-extension labels with their expected diatonic chord.
-
-        When the chord's root is a diatonic scale degree but the detected label
-        contains sus/add/parenthesised extensions or altered-interval suffixes
-        (b13, #11…), substitute the expected diatonic chord symbol for that root.
-        Plain triads and 7th chords (m7, maj7, 7, dim7) are passed through as-is.
-
-        Example (Eb minor key):
-            Ebmaddb13  →  Ebm     (i chord)
-            Gbsus4(13) →  Gb      (III chord)
-            Dbsus2(9)  →  Db      (VII chord)
-            Badd9      →  B       (VI chord)
-            Ebm7       →  Ebm7    (kept — 7th may be intentional)
-        """
+        """Replace sus/add/extended labels with the expected diatonic chord. Plain triads and 7ths pass through."""
         import re
         _COMPLEX = re.compile(r'(sus|add|\(|b\d|#\d)')
 
@@ -473,6 +468,101 @@ class GuitarChordPipeline:
         if len(symbol) > 1 and symbol[1] in ("#", "b"):
             root += symbol[1]
         return root
+
+    def _apply_midi_chord_override(
+        self,
+        frame_labels: list[str],
+        pm,
+        bpm: float,
+        key: str,
+        scale_type: str,
+        tuning=None,
+    ) -> list[str]:
+        """Three-pass MIDI override: suppress intro (pass 0), mark riff frames N.C. (pass 1), assign chord labels (pass 2)."""
+        from src.features.midi_chord_analyser import MidiChordAnalyser
+
+        analyser = MidiChordAnalyser(tuning=tuning)
+        chord_events = analyser.analyse(pm, bpm, key=key, scale_type=scale_type)
+
+        # Collect every MIDI note (with the same pitch ceiling as the analyser)
+        all_notes = []
+        for inst in pm.instruments:
+            if not inst.is_drum:
+                all_notes.extend(inst.notes)
+        if analyser.max_pitch is not None:
+            all_notes = [n for n in all_notes if n.pitch <= analyser.max_pitch]
+
+        if not all_notes and not chord_events:
+            return frame_labels
+
+        hop_sec = self.hop_length / self.sample_rate
+        result  = list(frame_labels)
+
+        # Pass 0: if the song starts with non-guitar audio, mark everything before first chord as N.C.
+        if chord_events and chord_events[0].start_time > 2.0:
+            pre_end = int(chord_events[0].start_time / hop_sec)
+            for f in range(min(pre_end, len(result))):
+                result[f] = "N.C."
+
+        # Pass 1: mark every MIDI note frame as N.C. (riff suppression). Skip artefacts < 50ms.
+        riff_covered: set[int] = set()
+        for note in all_notes:
+            if (note.end - note.start) < 0.05:
+                continue
+            s = int(note.start / hop_sec)
+            e = int(note.end   / hop_sec)
+            riff_covered.update(range(s, min(e + 1, len(result))))
+
+        for f in riff_covered:
+            result[f] = "N.C."
+
+        # Pass 2: write MIDI chord labels over the chord event frames.
+        for event in chord_events:
+            symbol = self._simplify_chord(
+                self._respell_for_key([event.symbol], key)[0]
+            )
+            if not symbol or symbol == "N.C.":
+                continue
+            s = int(event.start_time / hop_sec)
+            e = int(event.end_time   / hop_sec)
+            for f in range(s, min(e, len(result))):
+                result[f] = symbol
+
+        return result
+
+    @staticmethod
+    def _run_basic_pitch(guitar_waveform: torch.Tensor, sample_rate: int):
+        """Polyphonic pitch detection via basic-pitch ONNX model."""
+        import tempfile, os, logging
+        import soundfile as sf
+
+        # suppress backend-not-found warnings — we only use the ONNX backend
+        _prev = logging.root.level
+        logging.root.setLevel(logging.ERROR)
+        try:
+            from basic_pitch.inference import predict, Model
+            from basic_pitch import ICASSP_2022_MODEL_PATH
+        except ImportError:
+            logging.root.setLevel(_prev)
+            return None
+        finally:
+            logging.root.setLevel(_prev)
+
+        audio_np = guitar_waveform.squeeze().numpy()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            sf.write(tmp_path, audio_np, sample_rate)
+            model = Model(ICASSP_2022_MODEL_PATH)
+            _, midi_data, _ = predict(tmp_path, model)
+            return midi_data
+        except Exception as e:
+            print(f"  [Audio-to-MIDI] Error: {e}")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def _separate_guitar(self, waveform: torch.Tensor) -> torch.Tensor:
         """Isolate guitar via MelGuitarSeparator (STFT→Mel→U-Net→iSTFT, phase preserved)."""
@@ -529,8 +619,7 @@ class GuitarChordPipeline:
         audio = waveform.squeeze().numpy()
         total_frames = int(np.ceil(len(audio) / self.hop_length))
 
-        # Sliding-window RMS normalisation — equalises gain between soft fingerpicked
-        # and loud strummed passages so the onset detector doesn't miss quiet beats.
+        # Sliding-window RMS normalisation so quiet and loud passages are treated equally
         win_samples = int(2.0 * self.sample_rate)
         hop_samples = win_samples // 2
         audio_norm  = np.zeros_like(audio)
@@ -547,14 +636,18 @@ class GuitarChordPipeline:
 
         safe = weight_sum > 1e-8
         audio_norm[safe] /= weight_sum[safe]
-        # Normalised signal → onset/beat detection; original → chroma so silent
-        # sections still produce low energy and get labelled N.C.
 
-        # CENS chroma: log compression + temporal smoothing + L2 normalisation per
-        # frame gives stable averages under fingerpicking dynamics and bass bleed.
-        chroma = librosa.feature.chroma_cens(
+        # CQT chroma — E2 to D#6, covers all guitar chord tones
+        _fmin = librosa.note_to_hz('E2')
+        chroma = librosa.feature.chroma_cqt(
             y=audio, sr=self.sample_rate, hop_length=self.hop_length,
+            fmin=_fmin, n_octaves=4,
         )
+
+        # Flatness near 1.0 = noise/muted strum, near 0 = tonal — gates out dead strings
+        spec_flatness = librosa.feature.spectral_flatness(
+            y=audio, hop_length=self.hop_length
+        )[0]
 
         # Normalised audio so fingerpicked soft-attack notes contribute to onset envelope
         onset_env = librosa.onset.onset_strength(
@@ -566,8 +659,7 @@ class GuitarChordPipeline:
             hop_length=self.hop_length,
         )
 
-        # Bass string hit first on strum → dominant pitch class at onset = chord root.
-        # Disambiguates e.g. G major vs Em7 (same pitch-class set).
+        # Bass string hits first — strongest pitch class at onset = chord root hint
         onset_frames_arr = librosa.onset.onset_detect(
             onset_envelope=onset_env,
             sr=self.sample_rate,
@@ -579,7 +671,7 @@ class GuitarChordPipeline:
         from src.theory.intervals import NOTE_NAMES as _NOTE_NAMES
 
         if len(beat_frames) < 2:
-            # Fallback: single window over entire track
+            # fallback: single window over the whole track
             avg = chroma.mean(axis=1)
             norm = avg / (avg.max() + 1e-8)
             sorted_pcs = np.argsort(norm)[::-1]
@@ -590,8 +682,6 @@ class GuitarChordPipeline:
             conf = {_NOTE_NAMES[p]: float(norm[p]) for p in active_pcs}
             return [symbol] * total_frames, [(0, total_frames, conf)]
 
-        # At <80 BPM a single beat (~0.8 s) isn't long enough for fingerpicking to
-        # cover the full chord — use 2-beat windows to get stable chroma coverage.
         if len(beat_frames) >= 2:
             avg_beat_dur = (
                 (int(beat_frames[-1]) - int(beat_frames[0]))
@@ -601,9 +691,33 @@ class GuitarChordPipeline:
             detected_bpm = 60.0 / avg_beat_dur if avg_beat_dur > 0 else 120.0
         else:
             detected_bpm = 120.0
-        beats_per_window = 2 if detected_bpm < 80 else 1
-        window_starts = beat_frames[::beats_per_window]
-        boundaries = np.unique(np.concatenate([[0], window_starts, [total_frames]])).astype(int)
+
+        beat_dur_sec   = 60.0 / max(detected_bpm, 1.0)
+        # Merge onsets within one beat — strum/arpeggio counts as one chord
+        min_window_sec = max(0.25, beat_dur_sec * 1.0)
+
+        onset_list = sorted(onset_set)
+        if len(onset_list) >= 2:
+            raw_onset_times = librosa.frames_to_time(
+                onset_list, sr=self.sample_rate, hop_length=self.hop_length
+            )
+            merged_times: list[float] = [raw_onset_times[0]]
+            for ot in raw_onset_times[1:]:
+                if ot - merged_times[-1] >= min_window_sec:
+                    merged_times.append(ot)
+            merged_frames = librosa.time_to_frames(
+                merged_times, sr=self.sample_rate, hop_length=self.hop_length
+            )
+            boundaries = np.unique(
+                np.concatenate([[0], merged_frames, [total_frames]])
+            ).astype(int)
+        else:
+            # fallback: use beat-aligned windows for quiet passages
+            beats_per_window = 2 if detected_bpm < 80 else 1
+            window_starts = beat_frames[::beats_per_window]
+            boundaries = np.unique(
+                np.concatenate([[0], window_starts, [total_frames]])
+            ).astype(int)
 
         # Open-string pitch classes for root-note weighting
         open_string_pcs: Optional[set[int]] = None
@@ -623,9 +737,7 @@ class GuitarChordPipeline:
             seg = chroma[:, start:end]
             n   = seg.shape[1]
 
-            # 2× weight on the second half of each window: old strings decay there,
-            # new chord tones are fully established. Reduces "ringing contamination"
-            # from the previous chord without discarding the attack energy.
+            # 2x weight on second half — chord is settled there, reduces ringing from previous chord
             if n >= 4:
                 weights = np.ones(n)
                 weights[n // 2:] = 2.0
@@ -638,8 +750,7 @@ class GuitarChordPipeline:
                 for pc in open_string_pcs:
                     seg_chroma[pc] *= 1.25
 
-            # >15% onset energy gate: genuine strummed root spikes well above this;
-            # fingerpicking distributes energy broadly and won't clear it.
+            # root hint: dominant pitch at >15% onset energy is likely the bass root
             onset_root_pc: Optional[int] = None
             window_onsets = [f for f in onset_set if start <= f < end]
             if window_onsets:
@@ -654,26 +765,26 @@ class GuitarChordPipeline:
 
             seg_max = seg_chroma.max()
 
-            if seg_max < 0.05:
+            # muted strums are broadband noise (flatness > 0.15) — label as N.C.
+            window_flatness = float(
+                spec_flatness[start : min(end, len(spec_flatness))].mean()
+            ) if end > start else 0.0
+
+            if seg_max < 0.05 or window_flatness > 0.15:
                 label = "N.C."
                 conf: dict = {}
             else:
-                # 0.08 threshold (lowered from 0.10) keeps weaker chord tones
-                # that are still establishing when a previous chord is ringing out
                 l1 = seg_chroma.sum() + 1e-8
                 norm_l1 = seg_chroma / l1
                 sorted_pcs = np.argsort(norm_l1)[::-1]
-                active_pcs = [int(p) for p in sorted_pcs if norm_l1[p] > 0.08][:5]
+                active_pcs = [int(p) for p in sorted_pcs if norm_l1[p] > 0.10][:4]
                 label = self.chord_builder.identify_chord_from_pitches(
                     active_pcs, key_context=key, scale_pcs=scale_pcs,
                     onset_root_pc=onset_root_pc,
                 ) if active_pcs else "N.C."
 
-                # minor-maj7 almost never appears in pop/rock — it usually means
-                # previous-chord open strings are ringing. Retry at lower threshold
-                # (0.06) so the genuine new chord tones can tip the balance.
-                # B7-specific trigger: Em + D#/Eb energy is a strong signal that
-                # Em open strings are masking an incoming B7.
+                # minor-maj7 almost never appears in rock — usually ringing open strings.
+                # Retry with lower threshold. Also triggers for Em → B7 transitions.
                 _b7_signal = (
                     label.startswith("Em")
                     and norm_l1[3] > 0.06   # D#/Eb has meaningful energy
@@ -690,14 +801,29 @@ class GuitarChordPipeline:
                             label = retry
                             active_pcs = extended_pcs
 
+                # distorted guitar smears 5th harmonics into complex labels — check onset for power chord
+                _is_dim_or_complex = (
+                    'dim' in label or '#11' in label or 'aug' in label
+                )
+                if _is_dim_or_complex and onset_root_pc is not None and window_onsets:
+                    _of  = window_onsets[0]
+                    _ow  = chroma[:, _of : min(_of + 8, chroma.shape[1])].mean(axis=1)
+                    _tot = _ow.sum() + 1e-8
+                    _5pc = (onset_root_pc + 7) % 12
+                    _r_e = _ow[onset_root_pc] / _tot
+                    _5_e = _ow[_5pc] / _tot
+                    _m3  = _ow[(onset_root_pc + 3) % 12] / _tot
+                    _M3  = _ow[(onset_root_pc + 4) % 12] / _tot
+                    if _r_e > 0.13 and _5_e > 0.07 and _5_e > max(_m3, _M3):
+                        label = f"{_NOTE_NAMES[onset_root_pc]}5"
+
                 conf = {_NOTE_NAMES[p]: float(norm_l1[p]) for p in active_pcs}
 
             window_labels.append(label)
             window_spans.append((start, end))
             window_confidences.append(conf)
 
-        # Two passes remove isolated single-window spikes without cascading into
-        # genuine alternating progressions (convergence would flatten G B G B → G).
+        # Two passes smooth out isolated chord flickers without flattening alternating progressions
         for _pass in range(2):
             if len(window_labels) < 3:
                 break
@@ -730,6 +856,7 @@ class PipelineResult:
         guitar_waveform: Optional[torch.Tensor] = None,
         sample_rate: int = 44100,
         sections: Optional[list[SongSection]] = None,
+        basic_pitch_midi=None,
         tuning=None,
         tuning_confidence: float = 0.0,
         strum_pattern=None,
@@ -745,6 +872,7 @@ class PipelineResult:
         self.sample_rate = sample_rate
         self.sections = sections or []
         self.strum_pattern = strum_pattern
+        self.basic_pitch_midi = basic_pitch_midi
 
     def save_guitar_audio(self, output_path: str) -> str:
         """Save the extracted guitar audio to a WAV file."""
@@ -758,13 +886,29 @@ class PipelineResult:
         return output_path
 
     def export_midi(self, output_path: str) -> str:
-        """Export chord progression as MIDI (simultaneous notes per voicing)."""
+        """Export MIDI from basic-pitch transcription (with quantised copy), or chord voicings as fallback."""
+        from pathlib import Path as _Path
         from src.features.midi_exporter import MidiExporter
-        from src.theory.chord_voicings import ChordVoicingEngine
 
+        if self.basic_pitch_midi is not None:
+            # Strip high-register artefacts (overtones, reverb tails above C5)
+            pm_clean = MidiExporter.filter_pitch(self.basic_pitch_midi)
+            pm_clean.write(output_path)
+
+            # Quantised copy — 16th-note grid so strum notes group on the same beat
+            q_path = str(
+                _Path(output_path).with_name(
+                    _Path(output_path).stem + "_quantised.mid"
+                )
+            )
+            pm_q = MidiExporter.quantise_midi(pm_clean, self.analysis.bpm)
+            pm_q.write(q_path)
+            print(f"  [MIDI] Quantised copy saved: {_Path(q_path).name}")
+            return output_path
+
+        from src.theory.chord_voicings import ChordVoicingEngine
         engine = ChordVoicingEngine(tuning=self.tuning)
         exporter = MidiExporter(voicing_engine=engine, tuning=self.tuning)
-
         pm = exporter.export(
             self.chord_events,
             bpm=self.analysis.bpm,
